@@ -594,9 +594,10 @@ class Backend:
             account, workdir = self.source.identity()
         scope = (str(account), str(Path(workdir).resolve()))
         with self.analysis_cache_scope_lock:
-            if self.analysis_cache_scope is not None and self.analysis_cache_scope != scope:
-                self._clear_model_text_caches()
+            changed = self.analysis_cache_scope is not None and self.analysis_cache_scope != scope
             self.analysis_cache_scope = scope
+        if changed:
+            self._clear_model_text_caches()
         if scope not in self.stores:
             store = self.store_factory(account, workdir)
             normalize = getattr(store, "clear_legacy_suspensions", None)
@@ -766,6 +767,27 @@ class Backend:
         with self.api_lock:
             return self.model_source_store.public(self.active_model_source_mode,
                                                   self.active_model_source_id, "active")
+
+    def model_source_select(self, request):
+        """Only the assistant changes model; analysis selection and jobs stay intact."""
+        if not isinstance(request, dict) or set(request) != {"profileId"}:
+            raise ValueError("invalid model source request")
+        profile_id = request["profileId"]
+        with self.api_lock:
+            if profile_id is None:
+                self.model_source_store.clear_assistant_profile()
+            else:
+                self.model_source_store.select_assistant_profile(profile_id)
+            selected = self.model_source_store.assistant_selection()
+            result = {"profileId": selected.get("assistantProfileId"),
+                      "sourceId": selected["sourceId"], "revision": self.model_source_revision}
+        self._cancel_stale_advisor_runs()
+        return result
+
+    def _cancel_stale_advisor_runs(self):
+        advisor = getattr(self, "_advisor", None)
+        if advisor is not None:
+            advisor.cancel_stale_runs()
 
     def account_pin_status(self):
         return self.account_pin_store.status()
@@ -957,7 +979,9 @@ class Backend:
                 self.model_source_revision += 1
                 if was_api:
                     self._cancel_api_source_work_locked()
-            return self.model_source()
+            result = self.model_source()
+        self._cancel_stale_advisor_runs()
+        return result
 
     def set_conversation_requested(self, expected_account, session, requested):
         """Ask for one conversation to be analysed by the background sweep.
@@ -1106,7 +1130,9 @@ class Backend:
                     previous_context, credentials_changed=credentials_changed)
             else:
                 self.model_source_revision += 1
-            return {**self.model_source(), "profile": source_id}
+            result = {**self.model_source(), "profile": source_id}
+        self._cancel_stale_advisor_runs()
+        return result
 
     def model_source_profile_delete(self, request):
         if not isinstance(request, dict) or set(request) != {"profileId"}:
@@ -1121,7 +1147,9 @@ class Backend:
                 self.active_api_config = None
                 self.model_source_revision += 1
                 self._cancel_api_source_work_locked()
-            return self.model_source()
+            result = self.model_source()
+        self._cancel_stale_advisor_runs()
+        return result
 
     def _api_source_snapshot(self):
         """The single gate every provider turn passes: no user-chosen API source, no call.
@@ -1382,6 +1410,7 @@ class Backend:
         except Exception:
             with self.api_lock:
                 job.update(status="error", error="model-source-changed")
+        finally:
             self.api_tasks.finish()
 
     def _run_guidance_bound(self, job_key, job, scope, store, config, api_key, wire, targets,
@@ -1459,9 +1488,6 @@ class Backend:
                     "model-source-changed", "invalid-guidance", "guidance-version-invalid",
                     "invalid-request", "agent-changed", "agent-disabled", "agent-unknown", "skill-unknown"} else "model-analysis-failed"
                 job["status"] = "error"
-        finally:
-            self.api_tasks.finish()
-
     def _guidance_self_summary(self, store, job_key):
         """Self advice uses SELF turns; the stored conversation portrait describes OTHER."""
         return None

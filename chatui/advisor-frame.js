@@ -6,13 +6,16 @@
   const terminal = new Set(["done", "error", "stopped", "cancelled"]);
   const byId = id => document.getElementById(id);
   const agentName = byId("agentName"), agentMenu = byId("agentMenu"), menuButton = byId("btnAgentMenu");
+  const modelName = byId("modelName"), modelMenu = byId("modelMenu"), modelButton = byId("btnModelMenu");
   const timeline = byId("advisorTimeline"), welcome = byId("advisorWelcome"), welcomeText = byId("welcomeText");
   const input = byId("advisorInput"), send = byId("btnAdvisorSend"), stop = byId("btnStopRun"), retry = byId("btnRetryRun");
   const controls = byId("timelineControls");
   let sessionNonce = null, scope = null, templates = [], catalogReady = false, engineState = "unknown";
   let threadId = null, renderedScope = "", currentRun = null, submitting = false, stopping = false, retryKind = "load", problem = "";
+  let runSteps = [], stepRunId = "";
   let lastSavedMessage = null;
   let templateSignature = "";
+  let modelProfiles = [], assistantProfileId = "", modelSignature = "", selectingModel = false;
   const messageNodes = new Map();
   function transientMessage(message) {
     if (message.role !== "status") return false;
@@ -71,6 +74,40 @@
     if (timeline.children[timeline.children.length - 1] !== row) timeline.appendChild(row);
     updateLayout();
   }
+  function collectStep(steps, event) {
+    const api = window.AdvisorSteps;
+    return api && typeof api.collect === "function" ? api.collect(steps, event) : steps;
+  }
+  // A compact list of what the run is doing right now. It only shows coarse labels sent by the
+  // bridge and disappears as soon as the answer itself starts streaming.
+  function renderSteps() {
+    let host = document.getElementById("advisorSteps");
+    const running = !!currentRun && !terminal.has(currentRun.state);
+    if (!running || !runSteps.length || currentRun?.phase === "answering" || problem) {
+      if (host) host.remove();
+      return;
+    }
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "advisorSteps"; host.className = "advisor-steps";
+      host.setAttribute("role", "status"); host.setAttribute("aria-live", "polite");
+      host.setAttribute("aria-label", "执行步骤");
+    }
+    host.replaceChildren();
+    runSteps.forEach((step, index) => {
+      const row = document.createElement("div");
+      row.className = "advisor-step";
+      row.dataset.state = index === runSteps.length - 1 ? "active" : "done";
+      const mark = document.createElement("span");
+      mark.className = "advisor-step-mark"; mark.setAttribute("aria-hidden", "true");
+      const label = document.createElement("span");
+      label.className = "advisor-step-text"; label.textContent = step.text;
+      row.append(mark, label);
+      host.appendChild(row);
+    });
+    timeline.appendChild(host);
+    updateLayout();
+  }
   function updateLayout() {
     const hasMessages = messageNodes.size > 0;
     document.body.classList.toggle("advisor-empty", !hasMessages);
@@ -99,6 +136,30 @@
     agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false");
     updateControls();
   }
+  function renderModels() {
+    const signature = JSON.stringify([modelProfiles.map(profile => [profile.id, profile.name]), assistantProfileId]);
+    if (signature === modelSignature) return;
+    modelSignature = signature;
+    const selected = modelProfiles.find(profile => profile.id === assistantProfileId);
+    modelName.textContent = selected?.name || (modelProfiles.length ? "默认 API" : "模型");
+    modelButton.title = selected?.name || "使用保存的默认 API 档案";
+    modelButton.disabled = modelProfiles.length === 0;
+    modelMenu.replaceChildren();
+    const choices = modelProfiles.length ? [{ id: "", name: "默认 API" }, ...modelProfiles] : [];
+    for (const profile of choices) {
+      const button = document.createElement("button"); button.type = "button";
+      button.className = "advisor-agent-choice" + (profile.id === assistantProfileId ? " active" : "");
+      button.setAttribute("role", "menuitemradio"); button.setAttribute("aria-checked", String(profile.id === assistantProfileId));
+      button.textContent = profile.name; button.title = profile.name;
+      button.addEventListener("click", () => {
+        if (modelButton.disabled) return;
+        modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
+        if (profile.id !== assistantProfileId) sendToParent("ADVISOR_SELECT_MODEL", { profileId: profile.id || null });
+      });
+      modelMenu.appendChild(button);
+    }
+    modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
+  }
   function renderThread(thread, run, draft) {
     const nextScope = JSON.stringify([scope.account, scope.user, scope.agentId, scope.generation]);
     const changed = threadId !== thread.id || renderedScope !== nextScope;
@@ -126,8 +187,15 @@
   }
   function updateControls() {
     const running = !!currentRun && !terminal.has(currentRun.state);
+    modelButton.disabled = !modelProfiles.length || selectingModel || submitting || running;
+    // The host forwards one coarse status at a time (`run.phaseEvent`), so the list grows here
+    // by remembering each distinct label this run has shown.
+    if (currentRun?.id !== stepRunId) { stepRunId = currentRun?.id || ""; runSteps = []; }
+    if (running && currentRun?.phaseEvent) runSteps = collectStep(runSteps, currentRun.phaseEvent);
     const resetCommand = /^\s*\/reset\s*$/.test(input.value);
-    send.disabled = submitting || (!resetCommand && (running || !catalogReady || engineState !== "available")) || !scope?.account || !scope?.user || !scope?.agentId;
+    send.disabled = submitting || selectingModel || (!resetCommand && (running || !catalogReady || engineState !== "available")) || !scope?.account || !scope?.user || !scope?.agentId;
+    send.title = selectingModel ? "正在切换模型" : !catalogReady ? "正在加载助手" :
+      engineState !== "available" && !resetCommand ? "请在模型菜单选择可用的 API 档案" : "发送";
     stop.hidden = !running || resetCommand; send.hidden = running && !resetCommand;
     stop.disabled = stopping; stop.setAttribute("aria-label", stopping ? "正在停止" : "停止生成");
     stop.title = stopping ? "正在停止" : "停止生成";
@@ -143,7 +211,9 @@
       lastSavedMessage.text === "生成失败：" + currentRun.error;
     const content = submitting || stopping || problem ? event.text : running ? phase.text || labels[phase.state] || "正在准备" :
       currentRun?.state === "stopped" ? "已停止" : currentRun?.state === "error" && !savedError ? currentRun.error || "生成失败" : "";
-    statusRow("ui:run", content, event.state, event);
+    statusRow("ui:run", running && runSteps.length && currentRun?.phase !== "answering" && !problem && !stopping ? "" : content,
+      event.state, event);
+    renderSteps();
   }
   function applyStream(payload) {
     if (payload.threadId !== threadId) return;
@@ -190,7 +260,7 @@
       ADVISOR_SET_THREAD: ["thread", "run", "agentId", "draft"],
       ADVISOR_STREAM_UPDATE: ["threadId", "run", "messages"],
       ADVISOR_PROBLEM: ["error", "retryKind"], ADVISOR_SUBMIT_STATE: ["pending"], ADVISOR_STOP_STATE: ["pending"],
-      ADVISOR_COPY_RESULT: ["copied"]
+      ADVISOR_COPY_RESULT: ["copied"], ADVISOR_SET_MODELS: ["profiles", "assistantProfileId", "pending"]
     };
     if (!permitted[type] || Object.keys(payload).some(key => !permitted[type].includes(key))) return false;
     if (type === "ADVISOR_INIT" || type === "ADVISOR_SET_TEMPLATES") {
@@ -211,22 +281,40 @@
     if (type === "ADVISOR_PROBLEM" && (!text(payload.error, 20000) || !["send", "poll", "load", "catalog"].includes(payload.retryKind))) return false;
     if (["ADVISOR_SUBMIT_STATE", "ADVISOR_STOP_STATE"].includes(type) && typeof payload.pending !== "boolean") return false;
     if (type === "ADVISOR_COPY_RESULT" && typeof payload.copied !== "boolean") return false;
+    if (type === "ADVISOR_SET_MODELS") {
+      if (!Array.isArray(payload.profiles) || payload.profiles.length > 20 ||
+        !payload.profiles.every(item => object(item) && /^[0-9a-f]{32}$/.test(item.id) &&
+          text(item.name, 64) && item.name.trim().length > 0) ||
+        !(payload.assistantProfileId === null || /^[0-9a-f]{32}$/.test(payload.assistantProfileId)) ||
+        (payload.pending !== undefined && typeof payload.pending !== "boolean")) return false;
+    }
     return true;
   }
   menuButton.addEventListener("click", () => {
     agentMenu.hidden = !agentMenu.hidden; menuButton.setAttribute("aria-expanded", String(!agentMenu.hidden));
   });
+  modelButton.addEventListener("click", () => {
+    if (modelButton.disabled) return;
+    modelMenu.hidden = !modelMenu.hidden; modelButton.setAttribute("aria-expanded", String(!modelMenu.hidden));
+  });
   document.addEventListener("click", event => {
-    if (!event.target.closest?.(".advisor-agent-control")) { agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false"); }
+    if (!event.target.closest?.(".advisor-agent-control, .advisor-model-control")) {
+      agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false");
+      modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
+    }
   });
   document.addEventListener("keydown", event => {
-    if (event.key === "Escape") { agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false"); }
+    if (event.key === "Escape") {
+      agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false");
+      modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
+    }
   });
   stop.addEventListener("click", () => sendToParent("ADVISOR_STOP"));
   retry.addEventListener("click", () => sendToParent("ADVISOR_RETRY", { retryKind: currentRun?.state === "error" ? "send" : retryKind }));
   function submitMessage() {
     const value = input.value;
     if (!value.trim() || value.length > 16000 || send.disabled) return;
+    runSteps = []; stepRunId = "";
     submitting = true; updateControls();
     sendToParent("ADVISOR_SEND", { text: value, agentId: scope.agentId });
   }
@@ -259,6 +347,9 @@
     const payload = data.payload;
     if (data.type === "ADVISOR_SET_TEMPLATES") {
       templates = payload.enabledTemplates; catalogReady = payload.catalogReady; engineState = payload.engineState; renderTemplates();
+    } else if (data.type === "ADVISOR_SET_MODELS") {
+      modelProfiles = payload.profiles; assistantProfileId = payload.assistantProfileId || "";
+      selectingModel = payload.pending === true; renderModels(); updateControls();
     } else if (data.type === "ADVISOR_SET_THREAD") {
       renderTemplates(); renderThread(payload.thread, payload.run, payload.draft);
     } else if (data.type === "ADVISOR_STREAM_UPDATE") applyStream(payload);
@@ -272,5 +363,5 @@
       submitting = payload.pending; if (submitting) { problem = ""; statusRow("ui:problem", ""); } updateControls();
     } else if (data.type === "ADVISOR_STOP_STATE") { stopping = payload.pending; updateControls(); }
   });
-  updateControls(); updateLayout();
+  renderModels(); updateControls(); updateLayout();
 })();

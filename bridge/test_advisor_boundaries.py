@@ -338,7 +338,7 @@ class ServiceBoundaryTests(unittest.TestCase):
         self.assertEqual(self.service.catalog()["engine"]["state"], "available")
         run = self.completed(self.service.start(ACCOUNT, USER, AGENT, None, "local generation", "ollama"))
         self.assertEqual(run.state, "done")
-        self.assertIsNone(self.runtime.respond_calls[0][0]["apiKey"])
+        self.assertEqual(self.runtime.respond_calls[0][0]["apiKey"], "")
 
     def test_initial_retry_is_idempotent_even_without_thread_id(self):
         first = self.service.start(ACCOUNT, USER, AGENT, None, "same message", "idempotent")
@@ -547,7 +547,7 @@ class ServiceBoundaryTests(unittest.TestCase):
         self.assertNotIn("synthetic-private-path", run.error)
         self.assertIn("保存失败", run.error)
 
-    def test_agent_payload_has_welcome_and_no_reading_flow_or_counts(self):
+    def test_agent_payload_keeps_context_private_and_reports_only_an_actual_read_stage(self):
         entered, release = threading.Event(), threading.Event()
         def block(_source):
             entered.set()
@@ -558,7 +558,10 @@ class ServiceBoundaryTests(unittest.TestCase):
         result = self.service.start(ACCOUNT, USER, AGENT, payload["thread"]["id"], "first question", "silent-read")
         self.assertTrue(entered.wait(2))
         pending = self.service.events(ACCOUNT, USER, result["run"]["id"])
-        self.assertEqual(pending["events"], [])
+        self.assertEqual(pending["events"], [
+            {"seq": 1, "type": "status", "state": "reading", "text": "正在读取会话资料"}])
+        self.assertNotIn("first question", json.dumps(pending["events"]))
+        self.assertNotIn("消息内容", json.dumps(pending["events"], ensure_ascii=False))
         self.assertEqual(set(self.service.thread(ACCOUNT, USER, AGENT)["context"]), {"revision"})
         self.assertEqual([row["role"] for row in self.service.stores.account(ACCOUNT).thread_messages(result["threadId"])], ["user"])
         release.set()

@@ -8,19 +8,21 @@ imports a provider SDK and never activates or changes the local analysis
 source.
 
 Model configuration is resolved here, from ``ModelSourceStore`` only:
-``saved_selection()`` decides the saved profile and ``resolve_key()`` resolves
+``assistant_selection()`` chooses a dedicated profile or follows the saved analysis profile; ``resolve_key()`` resolves
 the key for a blank renderer request. Renderer requests never carry the key or
 the full history.
 """
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import threading
 import time
 from pathlib import Path
 from contextlib import contextmanager
+from urllib.parse import urlsplit
 
 from advisor_contracts import (
     HISTORY_BUDGET_PERCENT, MAX_SKILL_CONTENT, MAX_USER_MESSAGE, TERMINAL_RUN_STATES, AdvisorError, char_budget,
@@ -39,6 +41,28 @@ MAX_EVENT_BATCH = 500
 MAX_RUNS_IN_MEMORY = 64
 WORKER_DRAIN_SECONDS = 200
 STREAM_SCOPE_CHECK_SECONDS = 1.0
+
+
+def _allows_keyless_api(api):
+    if api.get("protocol") == "ollama":
+        return True
+    if api.get("protocol") != "chat_completions":
+        return False
+    value = api.get("baseUrl")
+    if not isinstance(value, str) or "\\" in value or any(char.isspace() for char in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname or
+                parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment):
+            return False
+        if parsed.port == 0:
+            return False
+        if parsed.hostname == "localhost":
+            return True
+        return ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        return False
 
 
 class _Run:
@@ -129,7 +153,8 @@ class AdvisorService:
 
     def _engine_selection(self):
         try:
-            selected = self.model_source_store.saved_selection()
+            choose = getattr(self.model_source_store, "assistant_selection", None)
+            selected = choose() if callable(choose) else self.model_source_store.saved_selection()
         except ModelSourceUnavailable:
             return None
         if not isinstance(selected, dict):
@@ -149,7 +174,7 @@ class AdvisorService:
         if callable(available) and not available():
             return {"state": "missing"}
         if (self.runtime_factory is not None and isinstance(api, dict) and
-                (api.get("protocol") == "ollama" or api.get("encryptedKey") or api.get("hasKey"))):
+                (_allows_keyless_api(api) or api.get("encryptedKey") or api.get("hasKey"))):
             return {"state": "available"}
         return {"state": "missing"}
 
@@ -178,12 +203,12 @@ class AdvisorService:
                                                        profile_id=api.get("id") or selected.get("profileId"))
         except (ModelSourceUnavailable, ValueError) as exc:
             raise AdvisorError("api-not-configured", "模型设置不可用，请重新保存 API 配置") from exc
-        if not key and api.get("protocol") != "ollama":
+        if not key and not _allows_keyless_api(api):
             raise AdvisorError("api-not-configured", "API 密钥不可用，请重新保存模型设置")
         database = database or self.stores.account(account)
         return {
             "protocol": api.get("protocol"), "baseUrl": api.get("baseUrl"),
-            "model": api.get("model"), "apiKey": key,
+            "model": api.get("model"), "apiKey": key or "",
             "contextTokens": api.get("contextTokens"),
             "sourceId": selected.get("sourceId") or LOCAL_SOURCE_ID,
             "stateDir": str(database.state_dir),
@@ -724,6 +749,7 @@ class AdvisorService:
         try:
             database = run.database
             self._check_run(run)
+            self._step(run, "reading", "正在读取会话资料")
             self.context.prepare(run.account, run.user, run.cancel, run.source_scope, binding=run.binding)
             self._check_run(run)
             with self.condition:
@@ -735,6 +761,7 @@ class AdvisorService:
             if snapshot["sourceFingerprint"] != run.source_scope:
                 raise AdvisorError("context-error", "聊天数据来源已经变化")
             self._check_run(run)
+            self._step(run, "preparing", "已读取 %d 条消息，正在整理上下文" % int(snapshot["readCount"]))
             with self.condition:
                 self._check_run(run, thorough=False)
                 database.freeze_run_context(run.id, snapshot["revision"])
@@ -786,6 +813,7 @@ class AdvisorService:
             self._check_run(run, fresh=True)
             if prompt_cost + len(run.message) + len(context_text) + margin > budget:
                 raise AdvisorError("context-too-long", "当前输入超出模型窗口，请缩短消息或更换模型")
+            self._step(run, "thinking", "正在调用模型")
             result = runtime.respond(config, request, lambda event: self._on_event(run, event),
                                      run.cancel)
             text = result.get("text") if isinstance(result, dict) else None
@@ -893,6 +921,13 @@ class AdvisorService:
 
         return compact
 
+    def _step(self, run, state, text):
+        """Publish a coarse stage label, never source text, prompt content or model reasoning."""
+        try:
+            self._on_event(run, {"type": "status", "state": state, "text": text})
+        except AdvisorError:
+            pass
+
     def _on_event(self, run, event):
         try:
             self._check_run(run, thorough=time.monotonic() - run.last_scope_check >= STREAM_SCOPE_CHECK_SECONDS)
@@ -910,7 +945,7 @@ class AdvisorService:
                 if run.last_status == signature:
                     return
                 run.last_status = signature
-                if normalized.get("state") in ("preparing", "thinking", "answering", "retry", "compacting"):
+                if normalized.get("state") in ("reading", "preparing", "thinking", "answering", "retry", "compacting"):
                     run.phase = normalized["state"]
             elif normalized["type"] == "reasoning":
                 run.phase = "thinking"

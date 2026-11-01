@@ -46,7 +46,7 @@ NATIVE_READER = (
 )
 LAYA = (
     "agent.ts", "calibration.ts", "catalog.ts", "context.ts", "expression.ts",
-    "forecast.ts", "general-intent.ts", "grounded-intent.ts", "index.ts", "LICENSE",
+    "forecast.ts", "general-intent.ts", "grounded-intent.ts", "intent-context.ts", "index.ts", "LICENSE",
     "message-batch.ts", "NOTICE", "options.ts", "personality.ts", "prompt.ts",
     "pyjson.ts", "questions.ts", "runner.ts", "scoring.ts", "social-cues.ts",
     "social-intents.ts", "style.ts", "tokenizer.ts", "types.ts",
@@ -72,6 +72,7 @@ PUBLIC_FILES = (
     "electron/local-message-insights.ts",
     "electron/advisor-runtime.ts", "chatui/advisor.js", "chatui/advisor.css",
     "chatui/advisor-frame.html", "chatui/advisor-frame.js", "chatui/advisor-ui-bundle.js",
+    "chatui/advisor-steps.js",
     "chatui/advisor-timeline.css", "licenses/OpenCode-MIT.txt",
     "chatui/advisor-window.html", "chatui/advisor-window.css", "chatui/advisor-window.js",
     "shared/contracts.ts", "shared/message-input.ts", "src/lib/labels.ts",

@@ -72,6 +72,38 @@ test('only owned native frames can send state and current scoped actions',()=>{
   f.ipcMain.emit('advisor:from-window',f.event(view),envelope('ADVISOR_SEND',{account:'other',user:'u',agentId:'advisor',generation:1},{text:'bad'}));assert.equal(f.main.webContents.sent.length,before+1);
   assert.equal(f.handlers.has('real-client:exit-app'),false);f.manager.close();
 });
+
+test('model profiles and assistant selection cross the actual native relay with existing scope and nonce checks',()=>{
+  const f=fixture();f.handlers.get('advisor:toggle')(f.event(f.main),true);
+  const view=f.views[0],init=envelope('ADVISOR_INIT');
+  f.ipcMain.emit('advisor:from-main',f.event(f.main),init);
+  const profiles=envelope('ADVISOR_SET_MODELS',undefined,{profiles:[{id:'b'.repeat(32),name:'Synthetic model'}],assistantProfileId:null,pending:false});
+  f.ipcMain.emit('advisor:from-main',f.event(f.main),profiles);
+  assert.deepEqual(view.webContents.sent.at(-1),{name:'advisor:to-window',value:profiles});
+  const select=envelope('ADVISOR_SELECT_MODEL',undefined,{profileId:'b'.repeat(32)});
+  let before=f.main.webContents.sent.length;
+  f.ipcMain.emit('advisor:from-window',f.event(view),select);
+  assert.equal(f.main.webContents.sent.length,before+1);
+  assert.deepEqual(f.main.webContents.sent.at(-1),{name:'advisor:to-main',value:select});
+  before=f.main.webContents.sent.length;
+  for(const invalid of [
+    {...select,nonce:'adv_'+'c'.repeat(32)},
+    {...select,scope:{...select.scope,generation:0}},
+    {...select,scope:{...select.scope,account:'another-account'}},
+    {...select,type:'ADVISOR_EXECUTE'},
+  ]) f.ipcMain.emit('advisor:from-window',f.event(view),invalid);
+  f.ipcMain.emit('advisor:from-window',f.event(f.main),select);
+  assert.equal(f.main.webContents.sent.length,before);
+  f.ipcMain.emit('advisor:modal',f.event(f.main),true);
+  f.ipcMain.emit('advisor:from-window',f.event(view),select);
+  assert.equal(f.main.webContents.sent.length,before);
+  f.ipcMain.emit('advisor:modal',f.event(f.main),false);
+  f.handlers.get('advisor:toggle')(f.event(f.main),false);
+  before=f.main.webContents.sent.length;
+  f.ipcMain.emit('advisor:from-window',f.event(view),select);
+  assert.equal(f.main.webContents.sent.length,before);
+  f.manager.close();
+});
 test('modal suspends the view and copy; hiding leaves the application alive',()=>{
   const f=fixture();f.handlers.get('advisor:toggle')(f.event(f.main),true);const view=f.views[0];f.ipcMain.emit('advisor:from-main',f.event(f.main),envelope('ADVISOR_INIT'));
   f.ipcMain.emit('advisor:modal',f.event(f.main),true);assert.equal(view.visible,false);f.ipcMain.emit('advisor:from-window',f.event(view),envelope('ADVISOR_COPY',undefined,{text:'suggestion'}),true);assert.equal(f.copied.length,0);

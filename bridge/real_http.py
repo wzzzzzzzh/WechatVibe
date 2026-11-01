@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import uuid
 from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -125,6 +126,32 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
             return (self.headers.get("Host") in hosts and
                     (origin is None or origin in origins) and
                     self.path.startswith("/") and not self.path.startswith("//"))
+
+        def discard_body(self):
+            """Drain only bounded rejected bodies; incomplete senders cannot hold a worker."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return
+            if not 0 < length <= 65536:
+                return
+            previous_timeout = self.connection.gettimeout()
+            deadline = time.monotonic() + 1
+            try:
+                while length:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self.connection.settimeout(remaining)
+                    chunk = self.rfile.read1(min(length, 8192))
+                    if not chunk:
+                        break
+                    length -= len(chunk)
+            except OSError:
+                pass
+            finally:
+                self.close_connection = True
+                self.connection.settimeout(previous_timeout)
 
         def send(self, status, body, content_type="application/json; charset=utf-8"):
             payload = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -299,6 +326,7 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
 
         def _do_POST(self):
             if not self.trusted_request():
+                self.discard_body()
                 return self.send(403, {"error": "forbidden"})
             endpoint = urlsplit(self.path).path
             if endpoint == "/api/control/shutdown":
@@ -314,7 +342,8 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
             model_endpoints = ("/api/model-source/list", "/api/model-source/test",
-                               "/api/model-source/activate", "/api/model-source/clear-key",
+                               "/api/model-source/activate", "/api/model-source/select",
+                               "/api/model-source/clear-key",
                                "/api/model-source/profiles", "/api/model-source/profiles/delete")
             if endpoint not in ("/api/analyze", "/api/predict-reply", "/api/messages/batch",
                                  "/api/runtime", "/api/local-model", "/api/model-insights",
@@ -326,6 +355,7 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                                  "/api/analysis-workers", "/api/api-workers",
                                  *advisor_http.POST_PATHS,
                                  *model_endpoints):
+                self.discard_body()
                 return self.send(404, {"error": "not found"})
             content_type = [part.strip().lower() for part in self.headers.get("Content-Type", "").split(";")]
             if content_type[0] != "application/json" or any(part != "charset=utf-8" for part in content_type[1:]):
@@ -351,6 +381,8 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                             return self.send(200, backend.model_source_test(request))
                         if endpoint == "/api/model-source/activate":
                             return self.send(200, backend.model_source_activate(request))
+                        if endpoint == "/api/model-source/select":
+                            return self.send(200, backend.model_source_select(request))
                         if endpoint == "/api/model-source/profiles":
                             return self.send(200, backend.model_source_profile_save(request))
                         if endpoint == "/api/model-source/profiles/delete":

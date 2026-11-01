@@ -5,6 +5,7 @@
   const object = value => value !== null && typeof value === "object" && !Array.isArray(value);
   const text = (value, limit) => typeof value === "string" && value.length <= limit;
   const id = value => text(value, 240) && value.length > 0;
+  const profileId = value => typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
   function nonce(prefix) {
     const bytes = new Uint8Array(16);
     window.crypto.getRandomValues(bytes);
@@ -33,6 +34,12 @@
       value.agentId === scope.agentId && Array.isArray(value.messages) && value.messages.every(message =>
         object(message) && id(message.id) && ["user", "assistant", "status"].includes(message.role) && text(message.text, 2000000));
   }
+  function validModelProfiles(value) {
+    return object(value) && Array.isArray(value.profiles) && value.profiles.length <= 20 &&
+      value.profiles.every(profile => object(profile) && profileId(profile.id) &&
+        text(profile.name, 64) && profile.name.trim().length > 0) &&
+      (value.assistantProfileId == null || profileId(value.assistantProfileId));
+  }
   function errorText(value) {
     if (text(value?.message, 20000) && value.message) return value.message;
     if (text(value?.error, 20000) && value.error) return value.error;
@@ -47,6 +54,7 @@
     frameReady: false, handshakeNonce: nonce("adv_"),
     catalog: { agents: [], skills: [], engine: { state: "missing" } },
     catalogReady: false, catalogError: "", catalogBusy: false,
+    modelProfiles: [], assistantProfileId: "", modelLoadSerial: 0, modelSelectionPending: false,
     drafts: storedObject("advisor_drafts_v1"), threadCache: storedObject("advisor_threads_v1"),
     pendingRequests: storedObject("advisor_pending_v1"),
     pollAbortController: null, submitPending: false, stopPending: false,
@@ -80,7 +88,13 @@
     },
     flushThreadCache() {
       clearTimeout(this.cacheSaveTimer); this.cacheSaveTimer = null;
-      save("advisor_threads_v1", this.threadCache);
+      // A run is live backend state; restoring it from browser storage creates an unreachable stop action.
+      const persisted = {};
+      for (const [key, thread] of Object.entries(this.threadCache)) {
+        persisted[key] = { ...thread };
+        delete persisted[key]._advisorRun;
+      }
+      save("advisor_threads_v1", persisted);
     },
     getEnabledTemplates() { return this.catalogReady ? this.catalog.agents.filter(agent => agent.enabled) : []; },
     getReplyContext() {
@@ -133,7 +147,7 @@
           delivery: pending.delivery || "pending", createdAtMs: pending.createdAtMs || Date.now() });
       }
       const saved = this.threadProjection;
-      return { thread, run: saved && this.isCurrent(saved.scope) && saved.thread.id === thread.id ? saved.run : cached._advisorRun || null };
+      return { thread, run: saved && this.isCurrent(saved.scope) && saved.thread.id === thread.id ? saved.run : null };
     },
     syncThreadToFrame(thread, run = null, scope = this.captureScope()) {
       if (!this.isCurrent(scope)) return;
@@ -150,6 +164,7 @@
       const scope = this.captureScope(), projection = this.projectionForScope(scope);
       this.postToFrame("ADVISOR_SET_TEMPLATES", { enabledTemplates: this.getEnabledTemplates(), activeAgentId: scope.agentId,
         catalogReady: this.catalogReady, engineState: this.catalogReady ? this.catalog.engine.state : "unknown" }, scope);
+      this.syncModelsToFrame(scope);
       this.syncThreadToFrame(projection.thread, projection.run, scope);
       this.postToFrame("ADVISOR_SUBMIT_STATE", { pending: this.submitPending }, scope);
       this.postToFrame("ADVISOR_STOP_STATE", { pending: this.stopPending }, scope);
@@ -181,6 +196,42 @@
       this.catalog = data; this.catalogReady = true; this.catalogError = "";
       this.clearProblem("catalog");
       this.syncTemplatesToFrame(); this.renderRepository(); return true;
+    },
+    async loadModelProfiles() {
+      if (this.modelSelectionPending) return false;
+      const serial = ++this.modelLoadSerial, scope = this.captureScope();
+      const data = await this.fetchJson("/api/model-source");
+      if (serial !== this.modelLoadSerial || !this.isCurrent(scope)) return false;
+      if (!validModelProfiles(data)) {
+        this.problem(data, scope, "catalog"); return false;
+      }
+      this.modelProfiles = data.profiles.map(profile => ({ id: profile.id, name: profile.name }));
+      this.assistantProfileId = data.assistantProfileId || "";
+      this.syncModelsToFrame(); return true;
+    },
+    syncModelsToFrame(scope = this.captureScope()) {
+      this.postToFrame("ADVISOR_SET_MODELS", { profiles: this.modelProfiles,
+        assistantProfileId: this.assistantProfileId || null, pending: this.modelSelectionPending }, scope);
+    },
+    async selectModelProfile(selectedId) {
+      if (this.modelSelectionPending || this.submitPending || this.currentRunId ||
+        (selectedId !== null && (!profileId(selectedId) || !this.modelProfiles.some(profile => profile.id === selectedId))) ||
+        selectedId === (this.assistantProfileId || null)) return;
+      const scope = this.captureScope();
+      this.modelLoadSerial++; this.modelSelectionPending = true; this.syncModelsToFrame();
+      try {
+        const result = await this.fetchJson("/api/model-source/select", { method: "POST",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify({ profileId: selectedId }) });
+        if (result?.profileId !== selectedId) {
+          this.problem({ error: result?.status === 400 ? "模型档案不存在或已更改" : errorText(result) }, scope, "catalog"); return;
+        }
+        this.modelLoadSerial++;
+        // Model selection belongs to the instance, including when the chat changed during the POST.
+        this.assistantProfileId = selectedId || "";
+        this.syncModelsToFrame(); await this.loadCatalog();
+      } finally {
+        this.modelSelectionPending = false; this.syncModelsToFrame();
+      }
     },
     async mutateCatalog(url, payload, onError) {
       const serial = ++this.catalogSerial;
@@ -260,13 +311,13 @@
     async startRun(message, agentId = this.activeAgentId) {
       const scope = this.captureScope();
       if (!this.isCurrent(scope) || !scope.account || !scope.user || !id(scope.agentId) || agentId !== scope.agentId ||
-        !text(message, 16000) || !message.trim() || this.submitPending) return;
+        !text(message, 16000) || !message.trim() || this.submitPending || this.modelSelectionPending) return;
       if (/^\s*\/reset\s*$/.test(message)) { await this.newThread(agentId, true); return; }
       if (this.currentRunId) return;
       if (!this.catalogReady || !this.catalog.agents.some(agent => agent.id === agentId && agent.enabled)) {
         this.problem({ error: "模板未启用" }, scope, "catalog"); return;
       }
-      if (this.catalog.engine.state !== "available") { this.problem({ error: "军师引擎未安装" }, scope, "catalog"); return; }
+      if (this.catalog.engine.state !== "available") { this.problem({ error: "请检查助手引擎和 API 模型配置" }, scope, "catalog"); return; }
       this.submitPending = true;
       this.clearProblem("send", scope);
       const key = this.scopeKey(scope.account, scope.user, scope.agentId);
@@ -492,6 +543,7 @@
         if (!visible && this.currentRunId) void this.stopRun();
         if (visible) {
           if (!this.catalogReady) await this.loadCatalog(); else await this.loadThread();
+          void this.loadModelProfiles();
           this.initFrameHandshake();
         }
         return visible;
@@ -512,7 +564,7 @@
       if (Object.keys(data).some(key => !["envelope", "nonce", "type", "payload", "scope"].includes(key))) return false;
       const allowed = { ADVISOR_FRAME_READY: [], ADVISOR_SWITCH_TEMPLATE: ["agentId"], ADVISOR_SEND: ["text", "agentId"],
         ADVISOR_STOP: [], ADVISOR_RETRY: ["retryKind"],
-        ADVISOR_DRAFT_UPDATE: ["draft", "agentId"], ADVISOR_COPY: ["text"] };
+        ADVISOR_DRAFT_UPDATE: ["draft", "agentId"], ADVISOR_COPY: ["text"], ADVISOR_SELECT_MODEL: ["profileId"] };
       if (!allowed[data.type] || Object.keys(data.payload).some(key => !allowed[data.type].includes(key))) return false;
       if (data.type === "ADVISOR_FRAME_READY") return true;
       if (!object(data.scope) || !this.isCurrent(data.scope) ||
@@ -520,6 +572,9 @@
       if (data.payload.agentId !== undefined && (!id(data.payload.agentId) ||
         (data.type !== "ADVISOR_SWITCH_TEMPLATE" && data.payload.agentId !== this.activeAgentId))) return false;
       if (data.type === "ADVISOR_SWITCH_TEMPLATE") return this.getEnabledTemplates().some(agent => agent.id === data.payload.agentId);
+      if (data.type === "ADVISOR_SELECT_MODEL") return Object.hasOwn(data.payload, "profileId") &&
+        (data.payload.profileId === null || profileId(data.payload.profileId) &&
+        this.modelProfiles.some(profile => profile.id === data.payload.profileId));
       if (data.type === "ADVISOR_SEND") return text(data.payload.text, 16000) && data.payload.text.trim().length > 0;
       if (data.type === "ADVISOR_DRAFT_UPDATE") return text(data.payload.draft, 16000);
       if (data.type === "ADVISOR_COPY") return text(data.payload.text, 2000000);
@@ -546,6 +601,7 @@
           this.generation++; this.abortCurrentPoll(); this.submitPending = false; this.activeAgentId = payload.agentId;
           save("advisor_active_agent", this.activeAgentId); this.syncTemplatesToFrame(); void this.loadThread();
         } else if (type === "ADVISOR_SEND") void this.startRun(payload.text, payload.agentId);
+        else if (type === "ADVISOR_SELECT_MODEL") void this.selectModelProfile(payload.profileId);
         else if (type === "ADVISOR_STOP") void this.stopRun();
         else if (type === "ADVISOR_DRAFT_UPDATE") this.setDraft(this.currentAccount, this.currentUser, this.activeAgentId, payload.draft);
         else if (type === "ADVISOR_RETRY") {
@@ -760,6 +816,10 @@
       finally { submit.disabled = false; }
     }, "advisor-btn advisor-btn-primary"); actions.appendChild(submit); modal.card.appendChild(actions);
   }
+  window.addEventListener("model-source-updated", () => {
+    if (!Advisor.panelVisible || Advisor.modelSelectionPending) return;
+    void Advisor.loadModelProfiles(); void Advisor.loadCatalog();
+  });
   window.Advisor = Advisor;
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", () => Advisor.init()); else Advisor.init();
 })();
